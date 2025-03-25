@@ -1,6 +1,6 @@
+import json
 import re
 import subprocess
-from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -13,51 +13,80 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.table import Table
 
 console = Console()
-targetVersion = "3.13.2"
+TARGET_VERSION = "3.13.2"
 
 
-def GetEnvs() -> list[str]:
+class GetEnvs:
     """
-    Returns a list of conda environments.
+    Callable class to retrieve a list of Conda environments.
 
     Returns
     -------
-    list of str
+    list[str]
         A list of environment names.
     """
 
-    result = subprocess.run(["conda", "env", "list"], stdout=subprocess.PIPE, text=True)
+    def __call__(self) -> list[str]:
+        result = subprocess.run(
+            ["conda", "env", "list"], stdout=subprocess.PIPE, text=True
+        )
 
-    envs = []
+        envs = []
+        for line in result.stdout.splitlines():
 
-    for line in result.stdout.splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
 
-        if line.startswith("#") or not line.strip():
-            continue
+            parts = line.split()
+            if parts[0] != "base":
+                envs.append(parts[0])
 
-        parts = line.split()
-
-        if parts[0] != "base":
-            envs.append(parts[0])
-
-    return envs
+        return envs
 
 
-def GetPythonVersion(env: str) -> str | None:
+def GetPackageDict(env: str) -> dict[str, str]:
     """
-    Gets the Python version for a given conda environment.
+    Retrieve a dictionary of package names and versions for a given environment.
 
     Parameters
     ----------
     env : str
-        The name of the conda environment.
+        The name of the Conda environment.
 
     Returns
     -------
-    str or None
-        The Python version, or None if not found.
+    dict[str, str]
+        A dictionary mapping package names to their versions.
+    """
+
+    result = subprocess.run(
+        ["conda", "list", "-n", env, "--json"], stdout=subprocess.PIPE, text=True
+    )
+
+    pkgList = json.loads(result.stdout)
+    pkgDict = {}
+    for pkg in pkgList:
+        pkgDict[pkg["name"]] = pkg["version"]
+
+    return pkgDict
+
+
+def GetPythonVersion(env: str) -> str:
+    """
+    Retrieve the Python version for a given environment.
+
+    Parameters
+    ----------
+    env : str
+        The name of the Conda environment.
+
+    Returns
+    -------
+    str
+        The Python version, or an empty string if not found.
     """
 
     result = subprocess.run(
@@ -68,23 +97,22 @@ def GetPythonVersion(env: str) -> str | None:
     )
 
     m = re.search(r"Python\s+(\S+)", result.stdout + result.stderr)
-
-    return m.group(1) if m else None
+    return m.group(1) if m else ""
 
 
 def UpgradeEnv(env: str) -> subprocess.CompletedProcess:
     """
-    Upgrades the Python version in a given conda environment.
+    Upgrade the Python version in a given environment.
 
     Parameters
     ----------
     env : str
-        The name of the conda environment.
+        The name of the Conda environment.
 
     Returns
     -------
     subprocess.CompletedProcess
-        The result of the subprocess run.
+        The result of the subprocess call.
     """
 
     return subprocess.run(
@@ -93,7 +121,7 @@ def UpgradeEnv(env: str) -> subprocess.CompletedProcess:
             "install",
             "-n",
             env,
-            f"python={targetVersion}",
+            f"python={TARGET_VERSION}",
             "--update-deps",
             "-y",
         ],
@@ -103,9 +131,10 @@ def UpgradeEnv(env: str) -> subprocess.CompletedProcess:
     )
 
 
-if __name__ == "__main__":
+if __name__ == "main":
 
-    envs = GetEnvs()
+    getEnvs = GetEnvs()
+    envs = getEnvs()
 
     with Progress(
         SpinnerColumn(),
@@ -120,39 +149,51 @@ if __name__ == "__main__":
         expand=True,
         console=console,
     ) as progress:
-
         task = progress.add_task("Upgrading Python in environments", total=len(envs))
 
         for env in envs:
+            preDict = GetPackageDict(env)
+            currentVersion = GetPythonVersion(env)
 
-            current = GetPythonVersion(env)
-
-            if not current:
+            if not currentVersion:
                 console.print(Panel(f"[yellow]{env}: No Python found[/]"))
-                progress.advance(task)
 
+                progress.advance(task)
                 continue
 
-            if current != targetVersion:
+            if currentVersion != TARGET_VERSION:
                 console.print(
                     Panel(
-                        f"[blue]{env}[/]: [yellow]{current}[/] → [green]{targetVersion}[/]"
+                        f"[blue]{env}[/]: [yellow]{currentVersion}[/] → [green]{TARGET_VERSION}[/]"
                     )
                 )
-
                 result = UpgradeEnv(env)
+                postDict = GetPackageDict(env)
+                table = Table(title=f"Environment: {env} Package Versions")
+                table.add_column("Package", style="cyan")
+                table.add_column("Old Version", style="yellow")
+                table.add_column("New Version", style="green")
+                allPkgs = set(preDict.keys()).union(postDict.keys())
 
-                if result.returncode == 0:
-                    console.print(
-                        Panel(
-                            f"[blue]{env}[/]: [green]Upgraded successfully to {targetVersion}[/]"
-                        )
-                    )
-                else:
-                    console.print(Panel(f"[blue]{env}[/]: [red]Upgrade failed[/]"))
+                for pkg in sorted(allPkgs):
+                    oldVer = preDict.get(pkg, "-")
+                    newVer = postDict.get(pkg, "-")
+                    table.add_row(pkg, oldVer, newVer)
+
+                console.print(table)
+
             else:
                 console.print(
-                    Panel(f"[blue]{env}[/]: Already at [green]{targetVersion}[/]")
+                    Panel(f"[blue]{env}[/]: Already at [green]{TARGET_VERSION}[/]")
                 )
+                postDict = GetPackageDict(env)
+                table = Table(title=f"Environment: {env} Package Versions (No Changes)")
+                table.add_column("Package", style="cyan")
+                table.add_column("Current Version", style="green")
+
+                for pkg in sorted(postDict.keys()):
+                    table.add_row(pkg, postDict[pkg])
+
+                console.print(table)
 
             progress.advance(task)
